@@ -3,8 +3,8 @@ package s3util
 import (
 	"bytes"
 	"encoding/xml"
-	"github.com/kr/s3"
 	"fmt"
+	"github.com/kr/s3"
 	"io"
 	"net/http"
 	"net/url"
@@ -88,6 +88,7 @@ func newUploader(url string, h http.Header, c *Config) (u *uploader, err error) 
 	if err != nil {
 		return nil, err
 	}
+	log.Printf("**** begin new upload at %s ****\n", u.url)
 	r.Header.Set("Date", time.Now().UTC().Format(http.TimeFormat))
 	for k := range h {
 		for _, v := range h[k] {
@@ -179,7 +180,51 @@ func (u *uploader) putPart(p *part) error {
 	if err != nil {
 		return err
 	}
+	log.Printf("**** putting part to url: %s ****\n", u.url)
 	req.ContentLength = p.len
+	req.Header.Set("Date", time.Now().UTC().Format(http.TimeFormat))
+	u.s3.Sign(req, u.keys)
+	resp, err := u.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		log.Printf("**** failt to put part. url: %s ****\nresponse:\n%#v", u.url, resp)
+		return newRespError(resp)
+	}
+	s := resp.Header.Get("etag") // includes quote chars for some reason
+	if len(s) < 2 {
+		return fmt.Errorf("received invalid etag %q", s)
+	}
+	p.ETag = s[1 : len(s)-1]
+	return nil
+}
+
+//retry completing the upload nTry times to
+func (u *uploader) retryCompleteUpload() error {
+	var err error
+	for i := 0; i < nTry; i++ {
+		err = u.completeUpload()
+		if err == nil {
+			return nil
+		}
+	}
+	return err
+}
+
+func (u *uploader) completeUpload() error {
+	body, err := xml.Marshal(u.xml)
+	if err != nil {
+		return err
+	}
+	b := bytes.NewBuffer(body)
+	v := url.Values{}
+	v.Set("uploadId", u.UploadId)
+	req, err := http.NewRequest("POST", u.url+"?"+v.Encode(), b)
+	if err != nil {
+		return err
+	}
 	req.Header.Set("Date", time.Now().UTC().Format(http.TimeFormat))
 	u.s3.Sign(req, u.keys)
 	resp, err := u.client.Do(req)
@@ -190,11 +235,6 @@ func (u *uploader) putPart(p *part) error {
 	if resp.StatusCode != 200 {
 		return newRespError(resp)
 	}
-	s := resp.Header.Get("etag") // includes quote chars for some reason
-	if len(s) < 2 {
-		return fmt.Errorf("received invalid etag %q", s)
-	}
-	p.ETag = s[1 : len(s)-1]
 	return nil
 }
 
@@ -213,28 +253,8 @@ func (u *uploader) Close() error {
 		return u.err
 	}
 
-	body, err := xml.Marshal(u.xml)
-	if err != nil {
-		return err
-	}
-	b := bytes.NewBuffer(body)
-	v := url.Values{}
-	v.Set("uploadId", u.UploadId)
-	req, err := http.NewRequest("POST", u.url+"?"+v.Encode(), b)
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Date", time.Now().UTC().Format(http.TimeFormat))
-	u.s3.Sign(req, u.keys)
-	resp, err := u.client.Do(req)
-	if err != nil {
-		return err
-	}
-	if resp.StatusCode != 200 {
-		return newRespError(resp)
-	}
-	resp.Body.Close()
-	return nil
+	err := u.retryCompleteUpload()
+	return err
 }
 
 func (u *uploader) abort() {

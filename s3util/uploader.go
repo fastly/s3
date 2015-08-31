@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"encoding/xml"
 	"fmt"
-	"github.com/kr/s3"
+	"github.com/fastly/s3"
 	"io"
 	"net/http"
 	"net/url"
